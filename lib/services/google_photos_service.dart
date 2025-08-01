@@ -4,10 +4,6 @@ import 'dart:io';
 import 'dart:convert';
 
 class GooglePhotosService {
-  // Your existing shared album ID
-  static const String _existingAlbumId =
-      '0AVMBsJiQ6_HSJCRYGIzbbK1RTKw_yWC3YpVd9P1N8GpFOmf6fccCx_YL4bvfWTEH7Gn0gw';
-
   static final GoogleSignIn _googleSignIn = GoogleSignIn(
     scopes: [
       'https://www.googleapis.com/auth/photoslibrary.appendonly',
@@ -24,21 +20,97 @@ class GooglePhotosService {
     return auth?.accessToken;
   }
 
-  // Return the existing album ID (no creation here)
-  static Future<String?> _getAlbumId() async {
-    // You can optionally add logic to verify album exists or fetch it
-    return _existingAlbumId;
+  // List albums and find album by title
+  static Future<String?> _getAlbumIdByTitle(String title, String token) async {
+    String? nextPageToken;
+    do {
+      final url = Uri.parse(
+        'https://photoslibrary.googleapis.com/v1/albums?pageSize=50${nextPageToken != null ? '&pageToken=$nextPageToken' : ''}',
+      );
+
+      final response = await http.get(
+        url,
+        headers: {
+          'Authorization': 'Bearer $token',
+          'Content-Type': 'application/json',
+        },
+      );
+
+      if (response.statusCode != 200) {
+        print('❌ Failed to list albums: ${response.body}');
+        return null;
+      }
+
+      final Map<String, dynamic> json = jsonDecode(response.body);
+      final List albums = json['albums'] ?? [];
+
+      for (final album in albums) {
+        if ((album['title'] ?? '') == title) {
+          return album['id'];
+        }
+      }
+
+      nextPageToken = json['nextPageToken'];
+    } while (nextPageToken != null);
+
+    return null;
   }
 
-  // Upload media to Google Photos and add to album
-  static Future<void> uploadMedia(File file) async {
+  // Create album with given title
+  static Future<String?> _createAlbum(String title, String token) async {
+    final response = await http.post(
+      Uri.parse('https://photoslibrary.googleapis.com/v1/albums'),
+      headers: {
+        'Authorization': 'Bearer $token',
+        'Content-Type': 'application/json',
+      },
+      body: jsonEncode({
+        "album": {"title": title},
+      }),
+    );
+
+    if (response.statusCode == 200) {
+      final json = jsonDecode(response.body);
+      return json['id'];
+    } else {
+      print('❌ Failed to create album: ${response.body}');
+      return null;
+    }
+  }
+
+  // Get album ID by title or create album if it does not exist
+  static Future<String?> getOrCreateAlbumId(String title) async {
+    final token = await _getAccessToken();
+    if (token == null) {
+      print("❌ Google Sign-In failed");
+      return null;
+    }
+
+    var albumId = await _getAlbumIdByTitle(title, token);
+    if (albumId == null) {
+      print("ℹ️ Album '$title' not found. Creating new album...");
+      albumId = await _createAlbum(title, token);
+      if (albumId == null) {
+        print("❌ Failed to create album '$title'");
+      }
+    } else {
+      print("ℹ️ Album '$title' found with ID: $albumId");
+    }
+    return albumId;
+  }
+
+  // Upload media and add to album
+  static Future<void> uploadMedia(
+    File file, {
+    String albumTitle = "Shared Album",
+  }) async {
     final token = await _getAccessToken();
     if (token == null) {
       print("❌ Google Sign-In failed");
       return;
     }
 
-    // Step 1: Upload the file to get an uploadToken
+    // Upload the photo bytes to get an upload token
     final uploadRes = await http.post(
       Uri.parse('https://photoslibrary.googleapis.com/v1/uploads'),
       headers: {
@@ -57,14 +129,11 @@ class GooglePhotosService {
 
     final uploadToken = uploadRes.body;
 
-    // Step 2: Get album ID (your shared album)
-    final albumId = await _getAlbumId();
-    if (albumId == null) {
-      print("❌ Album ID not found");
-      return;
-    }
+    // Get or create the album ID
+    final albumId = await getOrCreateAlbumId(albumTitle);
+    if (albumId == null) return;
 
-    // Step 3: Create media item in album
+    // Create the media item in the album using upload token
     final createItemRes = await http.post(
       Uri.parse(
         'https://photoslibrary.googleapis.com/v1/mediaItems:batchCreate',
@@ -85,44 +154,54 @@ class GooglePhotosService {
     );
 
     if (createItemRes.statusCode == 200) {
-      print("✅ Media uploaded successfully to shared album.");
+      print("✅ Media uploaded successfully to album '$albumTitle'.");
     } else {
       print("❌ Media item creation failed: ${createItemRes.body}");
     }
   }
 
-  // List media items in the shared album, return list of baseUrls
-  static Future<List<String>> listMediaInAlbum() async {
+  // List media URLs in album (supports pagination)
+  static Future<List<String>> listMediaInAlbum({
+    String albumTitle = "Shared Album",
+  }) async {
     final token = await _getAccessToken();
-    final albumId = await _getAlbumId();
-
-    if (token == null || albumId == null) {
-      print("❌ Missing token or album ID");
+    if (token == null) {
+      print("❌ Google Sign-In failed");
       return [];
     }
 
-    final response = await http.post(
-      Uri.parse('https://photoslibrary.googleapis.com/v1/mediaItems:search'),
-      headers: {
-        'Authorization': 'Bearer $token',
-        'Content-Type': 'application/json',
-      },
-      body: jsonEncode({"albumId": albumId, "pageSize": 50}),
-    );
+    final albumId = await getOrCreateAlbumId(albumTitle);
+    if (albumId == null) return [];
 
-    if (response.statusCode == 200) {
-      final jsonData = jsonDecode(response.body);
-      final mediaItems = jsonData['mediaItems'] as List<dynamic>?;
+    List<String> mediaUrls = [];
+    String? nextPageToken;
 
-      if (mediaItems == null) return [];
+    do {
+      final response = await http.post(
+        Uri.parse('https://photoslibrary.googleapis.com/v1/mediaItems:search'),
+        headers: {
+          'Authorization': 'Bearer $token',
+          'Content-Type': 'application/json',
+        },
+        body: jsonEncode({
+          "albumId": albumId,
+          "pageSize": 50,
+          if (nextPageToken != null) "pageToken": nextPageToken,
+        }),
+      );
 
-      // Return the baseUrls for thumbnails
-      return mediaItems
-          .map<String>((item) => item['baseUrl'] as String)
-          .toList();
-    } else {
-      print("❌ Failed to fetch media items: ${response.body}");
-      return [];
-    }
+      if (response.statusCode != 200) {
+        print("❌ Failed to fetch media items: ${response.body}");
+        break;
+      }
+
+      final json = jsonDecode(response.body);
+      final List items = json['mediaItems'] ?? [];
+      mediaUrls.addAll(items.map<String>((item) => item['baseUrl'] as String));
+
+      nextPageToken = json['nextPageToken'];
+    } while (nextPageToken != null);
+
+    return mediaUrls;
   }
 }
